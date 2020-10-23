@@ -1,0 +1,68 @@
+---
+- name: Execute backup 
+  hosts: Controller
+  become: yes
+  vars:
+    run_rear: false
+    nfs_server: 14.195.11.200
+
+  tasks:
+
+  - name: Mount NFS backup direcory for OSP services
+    mount:
+      src: "{{ nfs_server }}:/ctl_plane_backups"
+      path: /ctl_plane_backups
+      fstype: nfs4
+      opts: defaults,noauto
+      state: mounted
+
+  - name: Perform backup of MySQL database
+    script: files/mysql-backup.sh
+    when: inventory_hostname == groups.Controller[0]
+    
+  - name: Stop pacemaker cluster
+    command: pcs cluster stop --all
+    when: inventory_hostname == groups.Controller[0]
+
+  - name: Stop containers
+    shell: docker stop $(docker ps -a -q)
+
+  - name: Stop Ceph components
+    shell: systemctl stop ceph-mon@$(hostname -s) ceph-mgr@$(hostname -s) ceph-radosgw@$(hostname -s)
+   
+  - name: Run ReaR
+    command: rear -d -v mkbackup
+    when: run_rear|bool
+
+  - name: Unmount NFS backup direcory for OSP services
+    mount:
+      src: "{{ nfs_server }}:/ctl_plane_backups"
+      path: /ctl_plane_backups
+      fstype: nfs4
+      opts: defaults,noauto
+      state: unmounted
+
+  - name: Mount NFS backup direcory for Ceph MON
+    mount:
+      src: "{{ nfs_server }}:/ceph_backups"
+      path: /ceph_backups
+      fstype: nfs4
+      opts: defaults,noauto
+      state: mounted
+
+  - name: Configure backup directory
+    file:
+      path: "/ceph_backups/{{ ansible_hostname }}"
+      state: directory
+      mode: 0755
+
+  - name: backup ceph components
+    shell: "tar -zcv --xattrs-include=*.* --xattrs  --xattrs-include=security.capability --xattrs-include=security.selinux --acls -f /ceph_backups/{{ ansible_hostname }}/{{ ansible_hostname }}.tar.gz  /var/lib/ceph"
+
+  - name: Unmount NFS backup direcory for Ceph MON
+    mount:
+      src: "{{ nfs_server }}:/ceph_backups"
+      path: /ceph_backups
+      fstype: nfs4
+      state: unmounted
+

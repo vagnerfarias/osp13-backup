@@ -1,0 +1,188 @@
+---
+- name: Restore backup 
+  hosts: Controller
+  become: yes
+  vars:
+    run_rear: false
+    nfs_server: 14.195.11.200
+    mysql_db_file: openstack-backup-mysql.sql
+    mysql_grants_file: openstack-backup-mysql-grants.sql
+    backup_path: /var/lib/mysql
+    internalapi_domain: internalapi.localdomain
+
+  tasks:
+
+  - name: Mount NFS backup direcory for OSP services
+    mount:
+      src: "{{ nfs_server }}:/ctl_plane_backups"
+      path: /ctl_plane_backups
+      fstype: nfs4
+      opts: defaults,ro,noauto
+      state: mounted
+    when: inventory_hostname == groups.Controller[0]
+    tags:
+      - file_copy
+
+  - name: Identify MySQL VIP
+    command: hiera -c /etc/puppet/hiera.yaml mysql_vip
+    register: mysql_vip
+    tags:
+      - iptables_temp_add
+      - iptables_temp_delete
+
+  - name: Obtain MySQL root password
+    command: hiera -c /etc/puppet/hiera.yaml mysql::server::root_password
+    register: mysql_password
+    tags:
+      - mysql_password
+
+#  - name: Obtain clustercheck password
+#    command: hiera -c /etc/puppet/hiera.yaml mysql_clustercheck_password
+#    register: clustercheck_password
+
+  - name: Drop database connections through the VIP
+    iptables:
+      chain: INPUT
+      destination: "{{ mysql_vip.stdout }}"
+      destination_port: 3306
+      protocol: tcp
+      jump: DROP
+      comment: Temporarily block connections to MySQL VIP
+    tags:
+      - iptables_temp_add
+
+  - name: Unmanage Galera resource
+    command: pcs resource unmanage galera-bundle
+    when: inventory_hostname == groups.Controller[0]
+
+  - name: Shutdown MySQL on all controllers
+    shell: docker container stop $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=galera-bundle)
+    tags:
+      - mysql
+
+  - name: Create new MySQL DB directory to restore backup
+    script: files/intialize_db.sh
+    args:
+      creates: /var/lib/mysql-save
+
+  - name: Copy backup to MySQL directory
+    copy:
+      remote_src: yes
+      src: "/ctl_plane_backups/{{ item }}"
+      dest: "{{ backup_path }}"
+      backup: yes
+    loop:
+      - "{{ mysql_db_file }}"
+      - "{{ mysql_grants_file }}"
+    when: inventory_hostname == groups.Controller[0]
+    tags:
+      - file_copy
+
+  - name: Unmount NFS backup direcory for OSP services
+    mount:
+      src: "{{ nfs_server }}:/ctl_plane_backups"
+      path: /ctl_plane_backups
+      fstype: nfs4
+      opts: defaults,ro,noauto
+      state: absent
+    when: inventory_hostname == groups.Controller[0]
+    tags:
+      - file_copy
+
+  - name: Start MySQL container on all controllers
+    shell: docker container start $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=galera-bundle)
+    tags:
+      - mysql
+
+  - name: Reset MySQL root password
+    script: files/mysql_reset_password.sh "{{ mysql_password.stdout }}"
+    tags:
+      - mysql_password
+
+  - name: Restore MySQL database
+    script: files/mysql_restore_database.sh "{{ backup_path }}/{{ mysql_db_file }}" "{{ backup_path }}/{{ mysql_grants_file }}"
+    tags:
+      - mysql_restore
+    when: inventory_hostname == groups.Controller[0]
+
+  - name: Start database on bootstrap node
+    shell: >
+      docker exec $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=galera-bundle) \
+        /usr/bin/mysqld_safe --pid-file=/var/run/mysql/mysqld.pid --socket=/var/lib/mysql/mysql.sock --datadir=/var/lib/mysql \
+        --log-error=/var/log/mysql_cluster.log  --user=mysql --open-files-limit=16384 \
+        --wsrep-cluster-address=gcomm:// &
+    tags:
+      - mysql_bootstrap
+    when: inventory_hostname == groups.Controller[0]
+
+  - pause: 
+      prompt: Run 'clustercheck' in "{{ groups.Controller[0] }}" to ensure Galera cluster is synced before proceeding
+    tags:
+      - mysql_bootstrap
+      
+  - name: Start dababase on remaining nodes 
+    shell: >
+      docker exec $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=galera-bundle) \
+        /usr/bin/mysqld_safe --pid-file=/var/run/mysql/mysqld.pid --socket=/var/lib/mysql/mysql.sock --datadir=/var/lib/mysql \
+        --log-error=/var/log/mysql_cluster.log  --user=mysql --open-files-limit=16384 \
+        "--wsrep-cluster-address=gcomm://{{ groups.Controller[0] }}.{{ internalapi_domain }},{{ groups.Controller[1] }}.{{ internalapi_domain }},{{ groups.Controller[2] }}.{{ internalapi_domain }}" &
+    when: inventory_hostname != groups.Controller[0]
+    tags:
+      - mysql_sync
+
+  - pause: 
+      prompt: Run 'clustercheck' in "{{ groups.Controller[1] }}" and "{{ groups.Controller[2] }}" to ensure Galera cluster is synced before proceeding
+    tags:
+      - mysql_sync
+      - mysql_shutdown
+
+  - name: Stop MySQL on all nodes
+    shell: >
+      docker exec $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=galera-bundle) \
+        /usr/bin/mysqladmin -u root shutdown
+    tags:
+      - mysql_shutdown
+
+  - name: Remove firewall rule and allow database connections through the VIP
+    iptables:
+      chain: INPUT
+      destination: "{{ mysql_vip.stdout }}"
+      destination_port: 3306
+      protocol: tcp
+      jump: DROP
+      comment: Temporarily block connections to MySQL VIP
+      state: absent
+    tags:
+      - iptables_temp_delete
+
+  # Restarting containers just in case some undesired process is still running
+  - name: Restart MySQL container
+    shell: docker container restart $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=galera-bundle)
+    tags:
+      - mysql_manage
+
+  - name: Restart clustercheck container
+    shell: docker container restart $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=clustercheck) 
+    tags:
+      - mysql_manage
+      - clustercheck
+
+  - name: Manage Galera resource
+    command: pcs resource manage galera-bundle
+    when: inventory_hostname == groups.Controller[0]
+    tags:
+      - mysql_manage
+
+  - name: What to do next
+    debug:
+      msg:
+        - 'Things to do next:'
+        - '- Run "pcs status" and check the Galera resource bundle recovers correctly'
+        - '  ** Eventually the 3 nodes should be identified as "Master" **'
+        - '- Cleanup cluster resources'
+        - '- Test OpenStack APIs'
+        - "- Remove backup files from /var/lib/mysql on node {{ groups.Controller[0] }}"
+        - "  ** files {{ mysql_db_file }} and {{ mysql_grants_file }}"
+    run_once: True
+    tags:
+      - end_message

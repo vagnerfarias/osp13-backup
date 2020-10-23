@@ -1,0 +1,68 @@
+---
+- name: Configure backup tool
+  hosts: localhost,Controller
+  become: yes
+  vars:
+    nfs_server: 14.195.11.200
+
+  tasks:
+  - name: Install backup components
+    yum:
+      name: "{{ packages }}"
+      state: installed
+    vars:
+      packages:
+      - genisoimage
+      - rear
+      - nfs-utils
+  
+  - name: Configure backup mount point
+    file:
+      path: /ctl_plane_backups
+      state: directory
+      mode: 0755
+
+  - name: Configure NFS backup directory
+    mount:
+      src: "{{ nfs_server }}:/ctl_plane_backups"
+      path: /ctl_plane_backups
+      fstype: nfs4
+      state: present
+  
+  - name: Create the ReaR configuration file
+    template:
+      src: local.conf.j2
+      dest: /etc/rear/local.conf
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Create the rescue.conf file
+    copy:
+      src: rescue.conf
+      dest: /etc/rear/rescue.conf
+      owner: root
+      group: root
+      mode: 0644
+
+- name: Configure backup for collocated Ceph MON
+  hosts: Controller
+  become: yes
+  vars:
+    nfs_server: 14.195.11.200
+
+  tasks:
+  - name: Configure backup mount point for Ceph MON
+    file:
+      path: /ceph_backups/
+      state: directory
+      mode: 0755
+    
+  #- name: NFS backup direcory for Ceph MON
+  #  mount:
+  #    src: "{{ nfs_server }}:/ceph_backups"
+  #    path: /ceph_backups
+  #    fstype: nfs4
+  #    state: present
+
+

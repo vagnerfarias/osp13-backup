@@ -1,0 +1,47 @@
+---
+- name: Destroy MySQL database
+  hosts: Controller
+  become: yes
+
+  tasks:
+
+  - pause:
+      prompt: Are you sure you want do delete MySQL databases? (yes/no)
+    register: confirm_delete
+
+  - set_fact:
+      user_input: "{{ confirm_delete.user_input }}"
+    delegate_to: "{{ item }}"
+    loop: "{{ play_hosts }}"
+    run_once: yes
+
+  - debug:
+      msg: "{{ user_input }}"
+
+  - name: Unmanage Galera resource
+    command: pcs resource unmanage galera-bundle
+    when: inventory_hostname == groups.Controller[0] and user_input|bool
+    register: galera_unmanage
+
+  - name: Shutdown MySQL on all controllers
+    shell: docker container stop $(docker container ls --all --format "{{ '{{' }} .Names {{ '}}' }}" --filter=name=galera-bundle)
+    tags:
+      - mysql
+    when: user_input|bool
+
+  - name: Delete important database files
+    file:
+      path: "/var/lib/mysql/{{ item }}"
+      state: absent
+    loop:
+      - nova
+      - nova_api
+      - cinder
+      - keystone
+      - heat
+      - ibdata1
+    when: user_input|bool
+
+  - name: Manage Galera resource
+    command: pcs resource manage galera-bundle
+    when: inventory_hostname == groups.Controller[0] and user_input|bool

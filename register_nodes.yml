@@ -1,0 +1,37 @@
+---
+- name: Configure repositories
+  hosts: Controller
+  become: yes
+  vars_files:
+    - rhsm.yml
+  vars:
+    c_portal_register: true
+    repos:
+      - rhel-7-server-rpms
+      - rhel-7-server-extras-rpms
+      - rhel-7-server-rh-common-rpms
+      - rhel-ha-for-rhel-7-server-rpms
+      - rhel-7-server-openstack-13-rpms
+      - rhel-7-server-rhceph-3-mon-rpms
+
+  tasks:
+  - name: Register node to Customer Portal
+    redhat_subscription:
+      state: present
+      auto_attach: True
+      force_register: True
+      activationkey: "{{ activation_key | default(rhel_activation_key) }}"
+      org_id: "{{ organization_id }}"
+    when: c_portal_register|bool
+
+  - name: Ensure base repository is enabled - Customer Portal
+    shell: subscription-manager repos --disable=* --enable=rhel-7-server-rpms
+    when: c_portal_register|bool
+
+  - name: Enable required repositories
+    rhsm_repository:
+      name: "{{ repos }}"
+      state: enabled
+    when: c_portal_register|bool
+
+
